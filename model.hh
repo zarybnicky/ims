@@ -1,4 +1,5 @@
 #include "simlib/simlib.h"
+#include "simlib/internal.h"
 #include <cmath>
 
 class Timeout : public Event {
@@ -26,10 +27,10 @@ public:
 };
 
 class BurstGenerator : public Event {
-  int amount;
-  int delay;
+  int amount, delay, meanTime;
 public:
-  explicit BurstGenerator(int l, int d): amount(l), delay(d) {}
+  explicit BurstGenerator(int l, int d, int m):
+    amount(l), delay(d), meanTime(m) {}
   void Behavior();
 };
 
@@ -45,15 +46,26 @@ class VariedGenerator : public Event {
   int min, max, step, current;
   bool increasing = true;
 public:
-  explicit VariedGenerator(int a, int b, int s): min(a), max(b), step(s), current(a) {};
+  explicit VariedGenerator(int a, int b, int s):
+    min(a), max(b), step(s), current(a) {};
   void Behavior();
 };
 
 
-class AutoScaler : public Process {
-  double bottom, top;
-  int queued = 0;
+class AutoScaler : public Event {
+  unsigned int min, max;
+  double bottom, top, prevTime = 0;
 public:
-  explicit AutoScaler(double b, double t): bottom(b), top(t) {}
+  explicit AutoScaler(int _min, int _max, double b, double t):
+    min(_min), max(_max), bottom(b), top(t) {}
+  void Behavior();
+};
+
+class SpoolUp : public Process {
+  int n;
+public:
+  explicit SpoolUp(int t, int _n): n(_n) {
+    Activate(Time + t);
+  }
   void Behavior();
 };

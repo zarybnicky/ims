@@ -1,4 +1,3 @@
-# (setq org-export-latex-format-toc-function 'org-export-latex-no-toc)
 # (add-to-list 'org-latex-classes
 #           '("koma-article"
 #              "\\documentclass{scrartcl}"

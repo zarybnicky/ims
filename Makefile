@@ -29,11 +29,11 @@ DISCOBJFILES = \
 
 OBJFILES = $(BASEOBJFILES) $(CONTIOBJFILES) $(DISCOBJFILES)
 
-simlib.dll: ${SIMLIB}/version.o $(addprefix $(SIMLIB)/,$(OBJFILES))
+simlib.so: ${SIMLIB}/version.o $(addprefix $(SIMLIB)/,$(OBJFILES))
 	$(CXX) -fpermissive -shared -o $@ $^
 
-model: model.cc simlib.dll
+model: model.cc simlib.so
 #	$(CXX) -g -O2 -o $@ $^ -lsimlib -lm
 	$(CXX) -g -O2 -I${SIMLIB} -o $@ $^ -lm
 run: model
-	./model
+	LD_LIBRARY_PATH=.:$(LD_LIBRARY_PATH) ./model

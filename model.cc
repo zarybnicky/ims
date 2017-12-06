@@ -3,44 +3,66 @@
 
 #include "model.hh"
 
-const int TIMEOUT = 20;
+const int TIMEOUT = 25;
 const int SERVICE = 10;
 const int SPOOL_UP = 100;
+const double COST_PER_REPLICA_PER_TICK = 0.1;
 
 Store replicas("Online replicas", 1);
 Histogram hgram("Queue time", 0, 1, SERVICE + TIMEOUT + 1);
-long left = 0;
+TStat cost("Cost per auto-scaler frame");
+double accumCost = 0;
+
+long dropped = 0;
 
 int main() {
   //DebugON();
   Print("Web service scaling model (xzaryb00)\n");
-  SetOutput("model.out");
+  //SetOutput("model.out");
   Init(0, 1000);
-  (new LinearGenerator(10))->Activate();
-  (new AutoScaler(75, 85))->Activate();
+  (new LinearGenerator(1))->Activate();
+  (new BurstGenerator(100, 1, 50))->Activate();
+  (new AutoScaler(0, 0, .75, .85))->Activate();
   Run();
-  Print("Počet netrpělivých zákazníků: %d \n", left);
-  replicas.Output();
+  Print("Accumulated cost: %.2f \n", accumCost);
+  cost.Output();
+  Print("Dropped requests: %d \n", dropped);
   hgram.Output();
+  replicas.Output();
   return 0;
 }
 
 
 void AutoScaler::Behavior() {
-  // Handle replicas started in the previous iteration
-  if (queued > 0) {
-    replicas.SetCapacity(replicas.Capacity() + queued);
-    queued = 0;
-  }
+  double curCost = (Time + SERVICE + 1 - prevTime) * replicas.Capacity() * COST_PER_REPLICA_PER_TICK;
+  cost(curCost);
+  accumCost += curCost;
+  prevTime = Time;
 
-  double utilization = (replicas.Used() + replicas.Q->Length()) / replicas.Capacity();
+  double utilization = (replicas.Used() + replicas.Q->Length()) / (double)replicas.Capacity();
+  //Print("%.2f %u %u\n", utilization, replicas.Used() + replicas.Q->Length(), replicas.Capacity());
   if (utilization < bottom) {
-    replicas.SetCapacity(replicas.Capacity() - floor(bottom / utilization));
+    unsigned r = ceil(replicas.Capacity() * (utilization / bottom));
+    if (min > 0 && min > r) {
+      r = min;
+    }
+    replicas.SetCapacity(r);
   } else if (utilization > top) {
-    queued = ceil(utilization / top);
+    unsigned n = replicas.Capacity() + floor(utilization / top);
+    if (n == 0) {
+      n = 1;
+    }
+    if (max > 0 && max > n) {
+      n = max;
+    }
+    (new SpoolUp(SPOOL_UP, n - replicas.Capacity()))->Activate();
   }
-  Activate(Time + SPOOL_UP);
+  Activate(Time + SERVICE + 1);
 };
+
+void SpoolUp::Behavior() {
+  replicas.SetCapacity(replicas.Capacity() + n);
+}
 
 
 void LinearGenerator::Behavior() {
@@ -49,14 +71,12 @@ void LinearGenerator::Behavior() {
 }
 
 void BurstGenerator::Behavior() {
-  (new Request(TIMEOUT))->Activate();
-  Activate(Time + delay);
+  (new Burst(amount, delay))->Activate();
+  Activate(Time + Exponential(meanTime));
 }
 
 void Burst::Behavior() {
-  if (--amount < 0) {
-    Out();
-  } else {
+  if (--amount >= 0) {
     (new Request(TIMEOUT))->Activate();
     Activate(Time + delay);
   }
@@ -88,20 +108,26 @@ void VariedGenerator::Behavior() {
 void Timeout::Behavior() {
   ptr->Out();
   delete ptr;
-  left++;
+  dropped++;
   Cancel();
 }
 
 void Request::Behavior() {
   double arrival = Time;
+  Event *t = NULL;
   if (timeout > 0) {
-    Event *t = new Timeout(timeout, this);
-    Enter(replicas);
-    delete t;
+    t = new Timeout(timeout, this);
+  }
+  if (replicas.Capacity() == 0) {
+    replicas.QueueIn(this, 1);
+    Passivate();
   } else {
     Enter(replicas);
   }
+  if (t != NULL) {
+    delete t;
+  }
   Wait(SERVICE);
   Leave(replicas);
-  hgram(Time - arrival);
+  hgram(Time - SERVICE - arrival);
 }
