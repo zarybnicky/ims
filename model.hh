@@ -19,10 +19,17 @@ public:
 };
 
 
-class LinearGenerator : public Event {
+class SteadyGenerator : public Event {
+  int delay;
+public:
+  explicit SteadyGenerator(int m): delay(m) {}
+  void Behavior();
+};
+
+class RandomGenerator : public Event {
   int meanTime;
 public:
-  explicit LinearGenerator(int m): meanTime(m) {}
+  explicit RandomGenerator(int m): meanTime(m) {}
   void Behavior();
 };
 
@@ -64,8 +71,8 @@ public:
 class SpoolUp : public Process {
   int n;
 public:
-  explicit SpoolUp(int t, int _n): n(_n) {
-    Activate(Time + t);
+  explicit SpoolUp(int delay, int _n): n(_n) {
+    Activate(Time + delay);
   }
   void Behavior();
 };

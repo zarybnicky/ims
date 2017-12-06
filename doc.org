@@ -8,312 +8,359 @@
 #              ("\\subparagraph{%s}" . "\\subparagraph*{%s}")))
 #+LaTeX_CLASS: koma-article
 #+OPTIONS: toc:nil
-#+TITLE: Cost Efficiency versus Quality of Service in Autoscaling Web Services
+#+TITLE: Cost Efficiency versus Quality of Service in Auto-scaling Web Services
 #+AUTHOR: Jakub Zárybnický
 
-QoS vs cost efficiency
+* Introduction
+The topic that I've received, IT services, is a very wide one, with many
+possible interpretations. The problem that I've chosen to focus on is: "How
+to provide maximum availability of an auto-scaling service while being as
+cost-efficient as possible?" The platform that I assume is a web-service that
+uses a simple high-availability solution: a single load-balancer, behind which
+there are several replicas (or instances) of the application server. Each
+running replica costs money (a fixed cost per second, as is common in big cloud
+service providers), and we're trying to minimize our costs while providing a
+good user experience.
 
-Minimum average queue time vs minimum cost (and some hard constraints,
-e.g. queue time < 10ms)
-
-The problem that I've chosen to focus on is this: How to provide maximum service
-availability while being as cost-efficient as possible? The platform that I
-assume is a web-service that uses a simple high-availability solution: a single
-load-balancer, behind which there are several replicas (or instances) of the
-application server. Having a running replica costs money (a fixed cost per
-second, as is common in big cloud service providers), and we're trying to
-minimize our costs while providing a good user experience.
-
-There may be some hard constraints imposed on the simulation - e.g. the maximum number
-of replicas may be limited (by the cloud provider or by the company's CFO), we
-may have a specific hard upper limit on the quality, etc.
-
-I've chosen to represent quality-of-service as the time spent in the queue while
-waiting before a request starts being processed. This disregards a number of
-factors - the time spent processing a request, the time spent waiting for the
-database, ... These factors will be included as a random variable, but to
-simplify the model, I won't specify them in detail - as simulating e.g. database
-congestion or data consistency is a large topic, and I'll focus on replica
-scaling.
-
-Analytic solution of this system would be possible, but with my current
-mathematical knowledge, I'd have difficulties representing it in its entirety.
-
-The 'solution' we're looking for here are three parameters: minimum active
-replicas, maximum active replicas, and the auto-scaler thresholds.
-
-Inspiration:
 The topic of this work was inspired by my personal experiences and several
 interesting problems in my day job. Most of the information presented in the
 Analysis section were things that I've slowly accumulated over my IT career, and
 any references that I'd find would be retrospective. Nonetheless, I've attempted
 to back non-conceptual facts by references.
 
-https://www.researchgate.net/publication/261759640_A_queuing_theory_model_for_cloud_computing
-solves a similar problem, focusing on different parameters.
+While creating an analytic model of this system would be possible, I'd have
+difficulties representing it in its entirety with my current mathematical
+knowledge. The 'solution' we're looking for here are several parameters of the
+auto-scaler algorithm: upper and lower limits on the number of active replicas
+and the utilization thresholds (which when crossed will prompt the auto-scaler
+to either start or stop a replica).
 
-http://ieeexplore.ieee.org/document/6194446/ solves a similar problem using
-analytical methods.
+As a specific reference for this work, outside of my own previous experience, I've
+read several published papers, namely:
+- https://www.researchgate.net/publication/261759640_A_queuing_theory_model_for_cloud_computing
+  solves a similar problem, focusing on different parameters.
+- http://ieeexplore.ieee.org/document/6194446/ solves a similar problem using
+  analytical methods.
 
-Facts:
-- we assume that the number of replicas that we can potentially use is
-  unlimited - in practice, the number will be very high, but limited - but this
-  fact is unimportant, as I expect that in most simulations, we'll have a fixed
-  cap on the number of replicas
-- replica start time - in practice, this is a number that depends on the type of
-  machine that we use - spinning up a physical server may take 45s
-  (https://serverfault.com/questions/179714/fastest-time-to-get-an-ec2-instance-running),
-  starting a full virtualized machine half that (as the hardware is already
-  running), starting a simple Docker container takes less then 0.5s on my
-  machine (as the kernel used is already running), and starting a worker process
-  is nearly instantaneous.
-- replica shutdown time - instantaneous, as we disconnect a replica before
-  shutting it down.
-- client timeout - most web browsers use very large timeouts on the order of minutes
-  (https://stackoverflow.com/questions/5798707/browser-timeouts), so apart from
-  a few simulations, I won't be using timeouts
-- quality of service - a very wide term, in this model, I'll be using it to mean
-  the time spent in replica queue
-- we are interested only in the time spent in the queue, not in TTFB, database
-  congestion (this is a big topic to model, depends on db model (single-process
-  vs eventual consistency vs slow+immediate consistency)), nor processor utilization
-- auto-scaler properties - variable. The auto-scaler is a (meta)process that
-  starts and stops replicas based on the utilization of the system. It attempts
-  to keep the system to an ideal utilization (a parameter), constrained by a
-  minimum and maximum of replica amount. It needs to take into account the
-  start-up and shut-down time as well. I'll simulate the auto-scaler as a
-  periodic event that looks at the utilization (used vs total capacity) of the
-  available replicas.
-- request processing time - this is an arbitrary value. To simulate
-  different request types, I'll use a variable-time delay (switching between
-  several values based on their probability).
-- assumption - single-threaded machines. This is an unrealistic assumption, as
-  modern web servers are capable of handling hundreds of thousands of requests
-  per second (e.g. http://www.aosabook.org/en/posa/warp.html), but it simplifies
-  simulation quite a bit (as it would require e.g. an array of Stores). However,
-  as we're interested in queue times and not e.g. TTFB (time-to-first-byte) or
-  load times, this affects especially start-up and shut-down time factors, as in
-  real-life auto-scalers, it's CPU utilization that's the deciding factor, and
-  not the amount of free sockets. This simulation then most closely represents
-  modern single-threaded servers (e.g. Node.js), but even they use select, epoll
-  or kqueue to add quasi-parallelism. From another point-of-view, this could
-  also represent OS worker processes (not green threads), as used by e.g. Nginx.
-- assumption - zero replica failure. As the simulation time frame is not very
-  long and the reliability guaranteed cloud providers ranges from 98% to 99.999%
-  (e.g. https://www.forpsicloud.cz/vseobecne-podminky.aspx), we can safely
-  disregard this factor without much impact on the results.
-- assumption - ideal load balancer. In practice, high-availability (HA) is
-  implemented as a combination of HA DNS servers that direct users to several
-  (possibly geographically separated) load balancers, which then distribute
-  traffic among several web-servers
-  (e.g. https://www.digitalocean.com/community/tutorials/how-to-configure-dns-round-robin-load-balancing-for-high-availability). I
-  assume an ideal load balancer that works without hardware failures, and
-  that forwards requests instantaneously.
-- a simplification that could be removed if I used another approach - all
-  requests share a single queue. If I didn't rely on the single Store for
-  time-based statistics and if I manually updated a single TStat object, I could
-  use a vector/array/... of Facilities (or perhaps of Stores to even simulate
-  multiprocessing capabilities).
+(I apologize for the inline links, but the way I've used to compile to LaTeX
+doesn't currently support bibliographies.)
 
-Experimenting:
+* Analysis
+I assume that an auto-scaling web service is composed of two parts - a load
+balancer, the publicly exposed part of the service which accepts requests from
+clients (web browsers, other web services, ...); and a number of replicas of the
+application itself, which use identical code, and differ only in nominal
+factors.
 
-Several auto-scaler settings: one replica only (baseline), ten replicas,
-auto-scaling with a target of 50% utilization (45% and 55% thresholds),
-auto-scaling with a target of 80% utilization (75% and 85% thresholds).
+A real web service also has several other parts - a DNS server, which may choose
+to direct users to different load balancers (e.g. based on their geographical
+location,
+https://www.digitalocean.com/community/tutorials/how-to-configure-dns-round-robin-load-balancing-for-high-availability);
+a database, which is a difficult system to model; operating system factors (from
+socket number limits to virtualization overhead); hardware factors (network
+connection throughput, CPU performance), ... I've chosen to disregard these, as
+a complete model would be likely very complex, and to focus on my chosen issue.
 
-Several request generators: linear generator generates requests using a static
-exponential distribution; burst generator generates bursts of requests using an
-exponential distribution as well - one burst is an evenly spaced sequence of
-requests; varying-intensity generator uses an exponential distribution as well,
-but the mean time between requests oscillates between two values (a fixed-size
-step after every request).
+The load balancer accepts any requests it receives, and forwards them to one of
+application replicas based on several factors (round-robin, average CPU load,
+...; https://kemptechnologies.com/load-balancer/load-balancing-algorithms-techniques/)
 
-* Úvod
-Úvod musí vysvětlit, proč se celá práce dělá a proč má uživatel výsledků váš
-dokument číst (prosím, projekt sice děláte pro získání zápočtu v IMS, ale mohou
-existovat i jiné důvody). Případně, co se při čtení dozví.
+An application either accepts a request directly if it has a free processing
+slot, or it stays queued, from where it may be either accepted by the
+application at a later time, or time out if it doesn't get accepted in time.
 
-Například:
+The application likely implements some variant of concurrency to handle multiple
+requests simultaneously - from having several OS worker processes (Nginx,
+https://www.nginx.com/blog/thread-pools-boost-performance-9x) to using purely
+select/kqueue/epoll (Node.js) to green threads (Warp,
+http://www.aosabook.org/en/posa/warp.html).
 
-v této práci je řešena implementace ..., která bude použita pro sestavení modelu
-...  na základě modelu a simulačních experimentů bude ukázáno chování systému
-... v podmínkách ...  smyslem experimentů je demonstrovat, že pokud by ..., pak
-by ...
+A replica (application instance) takes some time to start before it is ready to
+process requests from the load balancer. This number varies greatly depending on
+the type of replica - spinning up a server may take 45s
+(https://serverfault.com/questions/179714/fastest-time-to-get-an-ec2-instance-running),
+starting a simple Docker container takes less then 0.5s on my machine (as the
+kernel the container uses is already running), and starting a worker process is
+nearly instantaneous. A replica, while being shut down, is disconnected from the
+load balancer immediately, as it cannot process requests while shutting down.
 
-Poznámka: u vyžádaných zpráv se může uvést, že zpráva vznikla na základě
-požadavku ... (u školní práce takto zdůvod'novat projekt ovšem nelze, že). Je
-velmi praktické zdůvodnit, v čem je práce náročná a proto přínos autora
-nepopiratelný (např. pro zpracování modelu bylo nutno nastudovat ..., zpracovat,
-... model je ve svém oboru zajímavý/ojedinělý v ...).
+** Technologies
+The implementation environment used is the SIMLIB library presented in
+demonstration lectures, as it was the most accessible one to me, given the
+limits on implementation languages (C/C++).
 
-grafy mají své náležitosti - identifikační název grafu (případně jeho číslo),
-cejchované osy s názvem veličiny na dané ose (včetně její jednotky). V případě
-grafu kombinujícího více jevů i legenda dokumentující grafické vyjádření jevů v
-grafu.
+However, given the specific requirements of my solution, I've needed to slightly
+edit the official SIMLIB library - namely the Store class, as I've encountered
+several limitations of its official SetCapacity, Enter, and Leave methods. I've
+included the patched SIMLIB library in its entirety (excluding the fuzzy
+sub-module), and it is compiled alongside my model.
 
-veškeré tabulky a grafy musí být komentovány v textu - čtenáři musí
-řečeno, co v tom grafu uvidí a čeho si má všimnout.
+The main structure of the solution was inspired by SIMLIB example programs and
+specific bits that were directly reused are marked in the source code.
 
-** Kdo se na práci podílel jako autor, odborný konzultant, dodavatel odborných faktů, význačné zdroje literatury/fakt, ...
-je ideální, pokud jste vaši koncepci konzultovali s nějakou autoritou v oboru (v
-IMS projektu to je hodnoceno, ovšem není vyžadováno)
+* Model
+Two main parameters that the model must represent is quality-of-service and cost
+of the web service, as those are the two factors we're trying to optimize.
 
-pokud nebudete mít odborného konzultanta, nevadí. Nelze ovšem tvrdit, že jste
-celé dílo vymysleli s nulovou interakcí s okolím a literaturou.
-** V jakém prostředí a za jakých podmínek probíhalo experimentální ověřování validity modelu
-pokud čtenář/zadavatel vaší zprávy neuvěří ve validitu vašeho modelu, obvykle
-vaši práci odmítne už v tomto okamžiku.
+I've chosen to represent quality-of-service as the time spent in the queue while
+waiting before a request starts being processed. This disregards a number of
+factors - the time spent processing a request, the time spent waiting for the
+database, ... These factors will be included as a fixed number, but to simplify
+the model, I won't specify them in detail - as simulating e.g. database
+congestion, processor utilization or network throughput is a large topic, and
+I'll focus on replica scaling.
 
-* Rozbor tématu a použitých metod/technologií
-Shrnutí všech podstatných faktů, které se týkají zkoumaného systému (co možná
-nejvěcnějším a technickým (ideálně formálně matematickým) přístupem, žádné
-literární příběhy).
+The auto-scaler is represented as a periodic event that starts and stops
+replicas based on the current utilization of the system, constrained by the
+upper and lower limit on the number of replicas. Utilization is calculated as
+the sum of the number of requests being processed and requests in queue divided
+by the number of available replicas.
 
-Podstatná fakta o systému musí být zdůvodněna a podepřena důvěryhodným zdrojem
-(vědecký článek, kniha, osobní měření a zjišťování). Pokud budete tvrdit, že
-ovce na pastvě sežere dvě kila trávy za den, musí existovat jiný (důvěryhodný)
-zdroj, který to potvrdí.
+The auto-scaler representation includes two other assumptions or
+simplifications. One is the queue of requests - the model I'm using contains a
+single queue shared among the available replicas, whereas in a real-world
+system, each instance would have its own queue. The other is the nature of an
+application instance - in this model, a replica is represented by a synchronous
+process that takes requests in order - this most closely resembles the
+processing model of PHP, or worker processes of Nginx. On the other hand, a
+replica takes a fixed amount of time to start, and shuts down instantaneously -
+that resembles starting and stopping a virtual machine or a container. I could
+model a replica as one SIMLIB Store, but that would require more bookkeeping and
+more patching of SIMLIB itself.
 
-Toto shrnutí určuje míru důvěryhodnosti vašeho modelu (nikdo nechce výsledky z
-nedůvěryhodného modelu). Pokud nebudou uvedeny zdroje faktů o vašem systému,
-hrozí ztráta bodů.
+The auto-scaler algorithm itself - while necessarily simplified, due to the
+absence of CPU utilization - works on the same principles as real ones. After a
+system utilization threshold has been crossed (too high or too low), an instance
+is either started or stopped. However, due to the scales used here, I've had to
+allow starting several instances simultaneously, as the system was often too
+slow to respond to sudden bursts of requests - given that a single replica
+usually represents a machine instance which can handle hundreds of requests per
+second at least, and here a replica handles its queued requests sequentially and
+synchronously.
 
-** Popis použitých postupů pro vytvoření modelu a zdůvodnění, proč jsou pro zadaný problém vhodné.
-Zdůvodnění může být podpořeno ukázáním alternativního přístupu a srovnáním s tím
-vaším. Čtenář musí mít jistotu, že zvolené nástroje/postupy/technologie jsou
-ideální pro řešení zadaného problému (ovšem, "dělám to v Javě, protože
-momentálně Java frčí..." nemusí zadavatele studie uspokojit).
+The set of replicas is then represented as a single Store with variable
+capacity - that is what has required me to patch SIMLIB, as the built-in Store
+implementation didn't support lowering of Store capacity.
 
-** Popis původu použitých metod/technologií
-(odkud byly získány (odkazy), zda-li jsou vytvořeny autorem) - převzaté části
-dokumentovat (specificky, pokud k nim přísluší nějaké autorské
-oprávnění/licence).
+I also assume that the number of replicas that we can potentially use is
+unlimited - in practice, the number will be very high, but limited by e.g. the
+provider's hardware - but this fact is unimportant, as I expect that in most
+simulations, we'll have a fixed cap on the number of replicas.
 
-Zdůvodnit potřebu vytvoření vlastních metod/nástrojů/algoritmů. Ve většině
-případů budete přebírat již navržené metody/algoritmy/definice/nástroje a je to
-pro školní projekt typické. Stejně tak je typické, že studenti chybně vymýšlí
-již hotové věci a dojdou k naprostému nesmyslu - je třeba toto nebezpečí
-eleminovat v tomto zdůvodnění.
+The load-balancer and replicas are then assumed to be ideal, without any
+failures (hardware or software), though this wouldn't affect simulation results
+much, given the short time-frame of a single run and the reliability guaranteed
+cloud providers which usually ranges from 98% to 99.999%
+(e.g. https://www.forpsicloud.cz/vseobecne-podminky.aspx).
 
-Velmi důležité, až fanaticky povinné, kontrolované a hodnocené: na každém místě
-v textu, kde se poprvé objeví pojem z předmětu IMS bude v závorce uveden odkaz
-na předmět a číslo slajdu, na kterém je pojem definován. Pokud bude významný
-pojem z předmětu IMS takto nedokumentován v textu a zjevně bude používán
-nevhodným nebo nepřesným způsobem, bude tento fakt hodnocen bodovou
-ztrátou. Tento požadavek je míněn s naprostou vážností.
+As for requests themselves, they have two parameters: their processing time,
+which I'll model as fixed, and their timeout - most web browsers use very large
+timeouts (on the order of minutes,
+https://stackoverflow.com/questions/5798707/browser-timeouts), so apart from a few
+simulation runs, I won't be using timeouts.
 
-Cílem je vyhnout se studentské tvůrčí činnosti ve vysvětlování známých pojmů,
-což mnohdy vede k naprostým bludům, ztrátě bodů a zápočtů. Pokud student pojem
-cituje korektně a přesto nekorektně používá, bude to hodnoceno dvojnásobnou
-bodovou ztrátou.
+* Implementation
+The model itself consists of three parts: one Store representing the set of
+running replicas (as described in the previous section), one auto-scaler process
+(a periodic event), which manipulates the replica Store's capacity and
+calculates current run-time costs, and a request generator (or several of them).
 
-* Koncepce
-Konceptuální model je abstrakce reality a redukce reality na soubor relevantních
-faktů pro sestavení simulačního modelu. Předpokládáme, že model bude obsahovat
-fakta z "Rozboru tématu". Pokud jsou některá vyřazena nebo modifikována, je nuto
-to zde zdůvodnit (například: zkoumaný subjekt vykazuje v jednom procentu případů
-toto chování, ovšem pro potřeby modelu je to naprosto marginální a smíme to
-zanedbat, neboť ...).
+I've included several request generator types - steady generator, which
+generates requests spaced by fixed delay, a simple random generator, which
+generates requests along an exponential distribution; burst generator, which
+generates bursts of requests along an exponential distribution - one burst is an
+evenly spaced sequence of requests; varying-intensity generator uses an
+exponential distribution as well, but the mean time between requests oscillates
+between two values (a fixed-size step after every request).
 
-Pokud některé partie reality zanedbáváte nebo zjednodušujete, musí to být
-zdůvodněno a v ideálním případě musí být prokázáno, že to neovlivní validitu
-modelu. Cílem konceptuálního (abstraktního) modelu je formalizovat relevantní
-fakta o modelovaném systému a jejich vazby. Podle koncept. modelu by měl být
-každý schopen sestavit simulační model.
+As mentioned in the 'Technologies' section, I've had to patch the SIMLIB library
+itself, due to limitations on the Store, namely on setting its capacity (and I
+was unable to extend it, as my extended class wouldn't be a 'friend' of Entity.
 
-** Způsob vyjádření konceptuálního modelu musí být zdůvodněn
-(na obrázku xxx je uvedeno schéma systému, v rovnicích xx-yy jsou popsány vazby
-mezi ..., způsob synchronizace procesů je na obrázku xxx s Petriho sítí).
+* Experimentation
+The goal of the following experiments is to find out the ideal values of the
+upper and lower limits on the number of replicas, and the 'scale up' and 'scale
+down' thresholds of the auto-scaler.
 
-** Formy konceptuálního modelu
-Podle potřeby uveďte konkrétní relevantní:
-- obrázek/náčrt/schéma/mapa (možno čitelně rukou)
-- matematické rovnice - u některých témat (např. se spojitými prvky,
-  optimalizace, ...) naprosto nezbytné. Dobré je chápat, že veličiny (fyzikální,
-  technické, ekonomické) mají jednotky, bez kterých údaj nedává smysl.
-- stavový diagram (konečný automat) nebo Petriho síť - spíše na abstraktní
-  úrovni. Petriho síť nemá zobrazovat výpočty a přílišné detaily. Pokud se
-  pohodlně nevejde na obrazovku, je nepoužitelná. Možno rozdělit na bloky se
-  zajímavými detaily a prezentovat odděleně abstraktní celek a podrobně
-  specifikované bloky (hierarchický přístup).
+In the course of experimentation, I've had to gradually edit the auto-scaler
+algorithm as described in the 'Model' section, as the original transcription of
+https://docs.wso2.com/display/ELB210/Demonstrating+the+Auto-Scaling+Algorithm
+didn't perform very well in my test runs, mainly due to the simplifications
+described above.
 
-Popište abstraktně architekturu vašeho programu, princip jeho činnosti, významné
-datové struktury a podobně. Smyslem této kapitoly je podat informaci o programu
-bez použití názvů tříd, funkcí a podobně.
+I'll be using several combinations of parameters and request generators. The
+input parameters are: request timeout, request processing time and replica start
+time. The input parameters to be optimized are the auto-scaler parameters: upper
+and lower limit on the number of replicas, scale-up and scale-down
+thresholds. These will change as well, but I'll observe their relationship with
+the QoS and accumulated cost of the system.
 
-Tuto kapitolu by měl pochopit každý technik i bez informatického
-vzdělání. Vyjadřovacími prostředky jsou vývojové diagramy, schémata, vzorce,
-algoritmy v pseudokódu a podobně. Musí zde být vysvětlena nosná myšlenka vašeho
-přístupu.
+Some expectations: I expect that given a steady non-zero request stream, the
+number of replicas will stay stable and the utilization will be inside the
+required bounds. For a burst of requests, the number of replicas will jump to a
+high enough number that after the start-up period, the replica set will be able
+to efficiently process the rest of the burst, and then will be scaled down. For
+a steadily changing request generator, the average queue time won't jump very
+high and the replica set will adjust up and down as required.
 
-* Architektura simulačního modelu
-Tato kapitola má různou důležitost pro různé typy zadání. U implementačních
-témat lze tady očekávat jádro dokumentace. Zde můžete využít zajímavého prvku ve
-vašem simulačním modelu a tady ho "prodat".
+In all simulations, the cost of running a single replica for one simulation tick
+will be equal to 1. Having a replica number equal to 0 means unlimited, whether
+upper or lower.
 
-Minimálně je nutno ukázat mapování abstraktního (koncept.) modelu do simulačního
-(resp. simulátoru). Např. které třídy odpovídají kterým procesům/veličinám a
-podobně.
+The target value 'efficiency' represents the quality-of-service and cost
+combined. While I'm sure I could find better metrics, one that has worked out
+well in preliminary tests was a simple product of the cost and average queue
+time divided by 1000, so that is the one I'll use in the presented results
+(given my time constraints). For this metric - same as for QoS and cost - lower
+means better.
 
-* Podstata simulačních experimentů a jejich průběh
-Nezaměňujte pojmy testování a experimentování (důvod pro bodovou ztrátu)!!!
+What follows is a tabular summary of input parameters and the average queue time
+and accumulated cost. The following parameters were fixed: timeout = 0,
+processing time = 10, start-up time = 100.
 
-Zopakovat/shrnout co přesně chcete zjistit experimentováním a proč k tomu
-potřebujete model. Pokud experimentování nemá cíl, je celý projekt špatně.
+** Steady request generator (spacing = 1)
+| Lower | Upper | Scale-down | Scale-up | Queue time |  Cost | Efficiency |
+|-------+-------+------------+----------+------------+-------+------------|
+|     0 |     0 |        0.1 |      0.9 |       0.47 | 48411 |      22.75 |
+|     1 |     0 |        0.1 |      0.9 |       0.22 | 27379 |       6.02 |
+|     2 |     0 |        0.1 |      0.9 |       0.46 | 27071 |      12.45 |
+|     0 |     0 |        0.5 |      0.6 |       0.08 | 33148 |       2.65 |
+|     0 |     0 |        0.6 |      0.7 |       0.13 | 29320 |       3.81 |
+|     0 |     0 |        0.7 |      0.8 |       0.22 | 25470 |        5.6 |
+|     0 |     0 |        0.8 |      0.9 |       0.38 | 25360 |       9.64 |
+|     0 |     0 |        0.9 |      1.0 |       0.38 | 23512 |       8.93 |
+|     0 |     0 |        1.0 |      1.1 |       0.66 | 19904 |      13.14 |
+|     0 |    12 |        0.9 |      1.0 |       0.39 | 23490 |       9.16 |
+|     0 |    11 |        0.9 |      1.0 |       0.51 | 21598 |      11.01 |
+|     0 |    10 |        0.9 |      1.0 |       7.76 | 19684 |     152.75 |
+|     0 |     9 |        0.9 |      1.0 |      55.36 | 17748 |     982.53 |
+|     0 |     8 |        0.9 |      1.0 |     102.86 | 15812 |    1626.42 |
+#+TBLFM: $7=round($5*$6/10)/100
 
-Je celkem přípustné u experimentu odhalit chybu v modelu, kterou na základě
-experimentu opravíte. Pokud se v některém experimentu nechová model podle
-očekávání, je nutné tento experiment důkladně prověřit a chování modelu
-zdůvodnit (je to součást simulačnické profese).
+The cost differences in the first three rows are due to the large difference in
+scale-up and -down thresholds - the auto-scaler cannot accurately capture the
+utilization of the system, and it is mostly start-up conditions that affect the
+number of replicas that run after the system achieves a steady state.
 
-Pokud model pro některé vstupy nemá důvěryhodné výsledky, je nutné to
-zdokumentovat. Pochopitelně model musí mít důvěryhodné výsledky pro většinu
-myslitelných vstupů.
+I was unable to set the utilization target higher than 100% due to the way the
+auto-scaler works - this is an implementation problem and not a fundamental
+one. In any case, I expect the queue times would rise drastically.
 
-** Naznačit postup experimentování
-jakým způsobem hodláte prostřednictvím experimentů dojít ke svému cíli (v
-některých situacích je přípustné "to zkoušet tak dlouho až to vyjde", ale i ty
-musí mít nějaký organizovaný postup).
+Most of the avg. queue time differences are due to start-up conditions, as
+requests back up at the start, before the auto-scaler ćan start enough replicas
+to correctly process all incoming requests as they come.
 
-** Dokumentace jednotlivých experimentů
-souhrn vstupních podmínek a podmínek běhu simulace, komentovaný výpis výsledků,
-závěr experimentu a plán pro další experiment (např. v experimentu 341. jsem
-nastavil vstup x na hodnotu X, která je typická pro ... a vstup y na Y, protože
-chci zjistit chování systému v prostředi ... Po skončení běhu simulace byly
-získány tyto výsledky ..., kde je nejzajímavější hodnota sledovaných veličin
-a,b,c které se chovaly podle předpokladu a veličin d,e,f které ne. Lze z toho
-usoudit, že v modelu není správně implementováno chování v podmínkách ... a
-proto v následujících experimentech budu vycházet z modifikovaného modelu verze
-... Nebo výsledky ukazují, že systém v těchto podmínkách vykazuje značnou
-citlivost na parametr x ... a proto bude dobré v dalších experimentech přesně
-prověřit chování systému na parametr x v intervalu hodnot ... až ...)
+I've experimentally determined that the number of replicas that can optimally
+process one request per tick is ten (obvious in retrospective, given that the
+number of ticks to process one request is ten) - in fact, if the starting number
+of replicas was 10, then the average queue time would be zero!
 
-** Závěry experimentů
-bylo provedeno N experimentů v těchto situacích ... V průběhu experimentování
-byla odstraněna ... chyba v modelu. Z experimentů lze odvodit chování systémů s
-dostatečnou věrohodností a experimentální prověřování těchto ... situací již
-napřinese další výsledky, neboť ...
+Two results can be gained from this set of runs - for a known size of the
+request stream, it pays off to set up your parameters precisely. This rarely
+happens in real life - at least for public services - but being aware of this
+can save money.
 
-* Shrnutí simulačních experimentů a závěr
-Závěrem dokumentace se rozumí zhodnocení simulační studie a zhodnocení
-experimentů (např. Z výsledků experimentů vyplývá, že ... při předpokladu, že
-... Validita modelu byla ověřena ... V rámci projektu vznikl nástroj ..., který
-vychází z ... a byl implementován v ...).
 
-do závěru se nehodí psát poznámky osobního charakteru (např. práce na projektu
-mě bavila/nebavila, ...). Technická zpráva není osobní příběh autora.
+** Random request generator (mean spacing = 1)
+| Lower | Upper | Scale-down | Scale-up | Queue time |  Cost | Efficiency |
+|-------+-------+------------+----------+------------+-------+------------|
+|     0 |     0 |        0.4 |      0.5 |       0.06 | 37720 |       2.26 |
+|     0 |     0 |        0.4 |      0.6 |       0.10 | 35894 |       3.59 |
+|     0 |     0 |        0.4 |      0.7 |       0.14 | 34530 |       4.83 |
+|     0 |     0 |        0.4 |      0.8 |       0.14 | 32506 |       4.55 |
+|     0 |     0 |        0.4 |      0.9 |       0.31 | 31274 |       9.69 |
+|     0 |     0 |        0.4 |      1.0 |       0.36 | 29030 |      10.45 |
+|     0 |     0 |        0.5 |      0.6 |       0.21 | 31186 |       6.55 |
+|     0 |     0 |        0.5 |      0.7 |       0.22 | 30504 |       6.71 |
+|     0 |     0 |        0.5 |      0.8 |       0.27 | 29360 |       7.93 |
+|     0 |     0 |        0.5 |      0.9 |       0.54 | 27974 |      15.11 |
+|     0 |     0 |        0.5 |      1.0 |       0.60 | 26610 |      15.97 |
+|     0 |     0 |        0.6 |      0.7 |       0.39 | 27776 |      10.83 |
+|     0 |     0 |        0.6 |      0.8 |       0.41 | 27116 |      11.12 |
+|     0 |     0 |        0.6 |      0.9 |       0.63 | 26610 |      16.76 |
+|     0 |     0 |        0.6 |      1.0 |       0.87 | 24938 |       21.7 |
+|     0 |     0 |        0.7 |      0.8 |       0.62 | 25048 |      15.53 |
+|     0 |     0 |        0.7 |      0.9 |       0.91 | 24542 |      22.33 |
+|     0 |     0 |        0.7 |      1.0 |       0.95 | 23948 |      22.75 |
+|     0 |     0 |        0.8 |      0.9 |       1.20 | 23090 |      27.71 |
+|     0 |     0 |        0.8 |      1.0 |       1.41 | 22562 |      31.81 |
+|     0 |     0 |        0.9 |      1.0 |       1.77 | 21638 |       38.3 |
+#+TBLFM: $7=round($5*($6/1000)*100)/100
 
-absolutně nikoho nezajímá, kolik úsilí jste projektu věnovali, důležitá je pouze
-kvalita zpracování simulátoru/modelu a obsažnost simulační studie (rozhodně ne
-např.: projekt jsem dělal ... hodin, což je víc než zadání
-předpokládalo. Program má ... řádků kódu). Pokud zdůrazňujete, že jste práci
-dělali významně déle než se čekalo, pak tím pouze demonstrujete vlastní
-neschopnost (to platí zejména v profesním životě).
+Now we're finally getting to more realistic scenarios. Having replicas as close
+to 100% utilization is more cost-efficient, as we've discovered in the previous
+section. However now, we see that such a system can't react to changes in
+request intensity as well as one that has wider thresholds. Here we can see that
+the final 'efficiency' metric that I've chosen isn't very configurable - a more
+realistic approach could be to set a avg. queue time cutoff (or perhaps median -
+which I'm not using simply because SIMLIB doesn't calculate it by default), and
+sort the remaining configurations by cost.
 
-do závěru se velmi nehodí psát "auto-zhodnocení" kvality práce, to je výhradně
-na recenzentovi/hodnotiteli (např. v projektu jsem zcela splnil zadání a
-domnívám se, že můj model je bezchybný a výsledky taktéž). Statisticky častý je
-pravý opak autorova auto-zhodnocení. Pokud přesto chcete vyzdvihnout kvalitu
-svého díla (což je dobře), tak vaše výroky musí být naprosto nepopiratelně
-zdůvodněny a prokázány (např. pomocí jiného referenčního přístupu, matematického
-důkazu, analýzy, ...).
+The one takeaway from this set of runs is this: having a lower average
+utilization helps with handling sudden increases in request intensity
+(represented here by a random distribution, later investigated by burst and
+combination generators). However, as before, having replicas that are fully
+utilized drives the costs down. Looking for more patterns in the above data, it
+seems that having a buffer of about 20% (i.e. scale-up factor = 0.8) helps avoid
+the biggest impact of sudden increases - though this should be investigated
+further by repeating these runs, as having a single request generator means that
+they are quite dependent on even slight patterns in the random data.
+
+
+** Burst request generator (mean spacing = 50, burst length = 50, burst spacing = 2)
+| Lower | Upper | Scale-down | Scale-up | Queue time |  Cost | Efficiency |
+|-------+-------+------------+----------+------------+-------+------------|
+|     0 |     0 |        0.5 |      0.8 |       0.16 | 30680 |       4.91 |
+|     5 |     0 |        0.5 |      0.8 |       0.09 | 31054 |       2.79 |
+|    10 |     0 |        0.5 |      0.8 |       0.08 | 33474 |       2.68 |
+|    15 |     0 |        0.5 |      0.8 |       0.02 | 36708 |       0.73 |
+|     0 |    30 |        0.5 |      0.8 |       0.17 | 30548 |       5.19 |
+|     0 |    25 |        0.5 |      0.8 |       0.41 | 30020 |      12.31 |
+|     0 |    20 |        0.5 |      0.8 |       0.89 | 28172 |      25.07 |
+|     0 |    15 |        0.5 |      0.8 |       4.92 | 23552 |     115.88 |
+|     5 |    30 |        0.5 |      0.8 |       0.09 | 30922 |       2.78 |
+|    10 |    30 |        0.5 |      0.8 |       0.09 | 33342 |          3 |
+|    15 |    30 |        0.5 |      0.8 |       0.02 | 36510 |       0.73 |
+#+TBLFM: $7=round($5*($6/1000)*100)/100
+
+Starting with one of the more efficient auto-scaler configurations from the
+previous experiment, we try to find the effect of limits on the number of
+replicas.
+
+In the first part, we can see that while having a higher number of stand-by
+replicas decreases the queue time, it increases the cost - though not as much as
+adding an upper limit in the second part decreases it. Having an unlimited lower
+limit means that at certain times, there is no replica running at all - and the
+effect of delaying the first requests can be seen on the queue time.
+
+I've looked at the maximum amount of replicas running in the baseline case
+(which was 32), and tried to find out the effect of decreasing the upper
+limit. It has decreased costs quite markedly at the cost of a lot higher queue
+time. In the case of sudden bursts like the simulated one, a common technique
+used is either plain rate limiting or more sophisticated techniques that prevent
+(Distributed)-Denial-of-Service ((D)DoS) attacks - but this risk needs to be balanced
+with the possibility of a legitimate source of an increased request intensity
+(e.g. a marketing campaign or a product launch).
+
+Based on these results, the best course of action seems to be setting up a small
+(but non-zero) lower limit, and setting up a higher limit several times higher
+than is the expected peak usage - and setting up a variant of (D)DoS protections.
+
+
+* Summary
+From the results, we can deduce several recommendations - for a private web
+service, or a web service with well-known usage characteristics, setting up very
+tight auto-scaler thresholds that maximize replica usage is the only
+cost-effective way.
+
+For public-facing web services or services without well-known or predictable
+usage patterns, lowering the lower auto-scaler threshold is a way to prevent
+small variations in request intensity from affecting QoS (namely lowering the
+maximum queue time).
+
+Setting up a lower limit on the number of replicas - even a small one -
+prevents a very high response time for the first few requests.
+
+Setting up some - likely quite high - upper limit on the number of replicas may
+guarantee some protection from excess costs in the case of (D)DoS and other
+attacks - depending on other available protections.
